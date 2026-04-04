@@ -19,72 +19,111 @@
 #include <Secrets.h>  // Contains MYSSID and MYPSK
 
 // ============ CONFIGURABLE PARAMETERS ============
-// WiFi credentials now in Secrets.h as MYSSID and MYPSK
-const char* MDNS_HOSTNAME = "usbmon";  // Access via usbmon.local
+const char* MDNS_HOSTNAME = "usbmon";
 
-// Pin definitions
-const int ADC_PIN = 0;              // GPIO 0 for current measurement
-const int OUTPUT_PIN = 10;          // GPIO 10 for output control
-const int BUTTON_PIN = 8;           // GPIO 8 for button input
-const int SDA_PIN = 7;              // GPIO 6 for OLED SDA
-const int SCL_PIN = 6;              // GPIO 7 for OLED SCL
+const int ADC_PIN = 0;
+const int OUTPUT_PIN = 10;
+const int BUTTON_PIN = 8;
+const int SDA_PIN = 7;
+const int SCL_PIN = 6;
 
-// Current measurement calibration
-const float SHUNT_RESISTANCE = 0.027;  // 50 milliohms
-const float ADC_REFERENCE_VOLTAGE = 0.95;  // 950mV for 0dB attenuation
-const int ADC_RESOLUTION = 4095;    // 12-bit ADC
-const float VOLTAGE_GAIN = 1.0;     // Amplifier gain (1.0 if direct connection)
-const float CURRENT_OFFSET = -0.15;   // Calibration offset in amps
+const float SHUNT_RESISTANCE = 0.027;
+const float ADC_REFERENCE_VOLTAGE = 0.95;
+const int ADC_RESOLUTION = 4095;
+const float VOLTAGE_GAIN = 1.0;
+const float CURRENT_OFFSET = -0.15;
 
-// Add after other globals
 Preferences preferences;
 
-// ADC Configuration (adjustable via web interface)
-int ADC_OVERSAMPLING = 1;           // Number of samples to average (1-64)
-float ADC_SMOOTHING = 1.0;           // Exponential smoothing factor (0.0-1.0)
+int ADC_OVERSAMPLING = 1;
+float ADC_SMOOTHING = 1.0;
 float filteredCurrent = 0.0;
 
-// Measurement settings
-const float CUTOFF_PERCENTAGE = 0.50;  // 50% of saved current
-const int SAMPLE_INTERVAL = 100;    // ADC sampling interval (ms)
-const int WEB_UPDATE_INTERVAL = 1000;  // Web chart update interval (ms)
-const int MAX_DATA_POINTS = 500;    // Maximum data points stored
+const float CUTOFF_PERCENTAGE = 0.50;
+const int SAMPLE_INTERVAL = 100;
+const int WEB_UPDATE_INTERVAL = 1000;
+const int MAX_DATA_POINTS = 500;
 
-// Timing variables
 unsigned long lastSampleTime = 0;
 unsigned long lastWebUpdate = 0;
 unsigned long lastMediumStore = 0;
 unsigned long lastLongStore = 0;
 
-// OLED settings
 const int SCREEN_WIDTH = 128;
 const int SCREEN_HEIGHT = 32;
-const int OLED_RESET = -1;          // Reset pin (-1 if sharing Arduino reset)
-const int OLED_ADDRESS = 0x3C;  // Try 0x3D instead of 0x3C
-
+const int OLED_RESET = -1;
+const int OLED_ADDRESS = 0x3C;
 // ============ END CONFIGURABLE PARAMETERS ============
 
 // ============ WIFI BACKGROUND STATE MACHINE ============
-// WiFi/networking initializes in the background so core boots instantly.
 enum WifiState {
-  WIFI_STATE_IDLE,        // Not started yet
-  WIFI_STATE_CONNECTING,  // WiFi.begin() called, waiting for connection
-  WIFI_STATE_CONNECTED,   // WiFi connected, setting up services
-  WIFI_STATE_READY        // All services running
+  WIFI_STATE_IDLE,
+  WIFI_STATE_CONNECTING,
+  WIFI_STATE_CONNECTED,
+  WIFI_STATE_READY
 };
 
 WifiState wifiState = WIFI_STATE_IDLE;
 unsigned long wifiStartTime = 0;
-const unsigned long WIFI_TIMEOUT_MS = 20000;  // Give up after 20s, retry later
+const unsigned long WIFI_TIMEOUT_MS = 20000;
 unsigned long wifiRetryTime = 0;
-const unsigned long WIFI_RETRY_INTERVAL = 30000; // Retry every 30s if failed
+const unsigned long WIFI_RETRY_INTERVAL = 30000;
 bool wifiServicesStarted = false;
+// ============ END WIFI STATE MACHINE ============
 
+// Global objects — declared before wifiBackgroundTick() uses them
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+WebServer server(80);
+
+float currentCurrent = 0.0;
+float savedCurrent = 0.0;
+float cutoffThreshold = 0.0;
+unsigned long chargeStartTime = 0;
+unsigned long chargeElapsedTime = 0;
+bool monitoring = false;
+bool outputEnabled = true;
+bool chargingComplete = false;
+
+bool lastButtonState = LOW;
+bool buttonState = LOW;
+unsigned long lastDebounceTime = 0;
+unsigned long buttonPressStartTime = 0;
+bool buttonPressHandled = false;
+const unsigned long DEBOUNCE_DELAY = 50;
+const unsigned long LONG_PRESS_TIME = 1000;
+
+struct DataPoint {
+  unsigned long timestamp;
+  float current;
+};
+
+#define RECENT_POINTS 100
+#define MEDIUM_POINTS 60
+#define LONG_POINTS 100
+
+DataPoint recentData[RECENT_POINTS];
+DataPoint mediumData[MEDIUM_POINTS];
+DataPoint longData[LONG_POINTS];
+
+int recentIndex = 0;
+int mediumIndex = 0;
+int longIndex = 0;
+
+// Forward declarations for web handlers used in wifiBackgroundTick
+void handleRoot();
+void handleCurrent();
+void handleHistory();
+void handleGetSettings();
+void handleSetSettings();
+void handleToggleOutput();
+String getIndexHTML();
+
+// ============ WIFI BACKGROUND TICK ============
+// Called from loop(). All globals are fully declared above, so no forward-ref issues.
 void wifiBackgroundTick() {
   switch (wifiState) {
 
     case WIFI_STATE_IDLE:
-      // Start connecting
       WiFi.mode(WIFI_STA);
       WiFi.begin(MYSSID, MYPSK);
       wifiStartTime = millis();
@@ -102,13 +141,11 @@ void wifiBackgroundTick() {
         Serial.println("\nWiFi: timed out, will retry later");
         WiFi.disconnect(true);
         wifiRetryTime = millis();
-        wifiState = WIFI_STATE_IDLE;  // Re-arm for retry below
-        // Prevent immediate re-trigger — handled by retry guard in loop
+        wifiState = WIFI_STATE_IDLE;
       }
       break;
 
     case WIFI_STATE_CONNECTED:
-      // Setup mDNS
       if (!MDNS.begin(MDNS_HOSTNAME)) {
         Serial.println("Error setting up mDNS responder!");
       } else {
@@ -118,16 +155,10 @@ void wifiBackgroundTick() {
         MDNS.addService("http", "tcp", 80);
       }
 
-      // Setup OTA
       ArduinoOTA.setHostname(MDNS_HOSTNAME);
 
       ArduinoOTA.onStart([]() {
-        String type;
-        if (ArduinoOTA.getCommand() == U_FLASH) {
-          type = "sketch";
-        } else {
-          type = "filesystem";
-        }
+        String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
         Serial.println("Start updating " + type);
         display.clearDisplay();
         display.setTextSize(1);
@@ -162,22 +193,15 @@ void wifiBackgroundTick() {
 
       ArduinoOTA.onError([](ota_error_t error) {
         Serial.printf("Error[%u]: ", error);
-        if (error == OTA_AUTH_ERROR) {
-          Serial.println("Auth Failed");
-        } else if (error == OTA_BEGIN_ERROR) {
-          Serial.println("Begin Failed");
-        } else if (error == OTA_CONNECT_ERROR) {
-          Serial.println("Connect Failed");
-        } else if (error == OTA_RECEIVE_ERROR) {
-          Serial.println("Receive Failed");
-        } else if (error == OTA_END_ERROR) {
-          Serial.println("End Failed");
-        }
+        if (error == OTA_AUTH_ERROR)         Serial.println("Auth Failed");
+        else if (error == OTA_BEGIN_ERROR)   Serial.println("Begin Failed");
+        else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+        else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+        else if (error == OTA_END_ERROR)     Serial.println("End Failed");
       });
 
       ArduinoOTA.begin();
 
-      // Setup web server routes
       server.on("/", HTTP_GET, handleRoot);
       server.on("/current", HTTP_GET, handleCurrent);
       server.on("/history", HTTP_GET, handleHistory);
@@ -185,7 +209,8 @@ void wifiBackgroundTick() {
       server.on("/settings", HTTP_POST, handleSetSettings);
       server.on("/toggle", HTTP_POST, handleToggleOutput);
 
-      server.on("/debug", HTTP_GET, [](){
+      // [&] capture gives the lambda access to all globals (server, recentIndex, etc.)
+      server.on("/debug", HTTP_GET, [&](){
         String html = "<html><body><h2>Data Buffer Status</h2>";
         html += "<p>Uptime: " + String(millis() / 1000) + " seconds</p>";
         html += "<p>Recent buffer: " + String(recentIndex) + " / " + String(RECENT_POINTS) + "</p>";
@@ -209,7 +234,6 @@ void wifiBackgroundTick() {
       break;
 
     case WIFI_STATE_READY:
-      // Check for unexpected disconnection and re-arm
       if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi: lost connection, will reconnect...");
         wifiServicesStarted = false;
@@ -219,60 +243,16 @@ void wifiBackgroundTick() {
       break;
   }
 }
-// ============ END WIFI STATE MACHINE ============
-
-// Global variables
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-WebServer server(80);
-
-float currentCurrent = 0.0;
-float savedCurrent = 0.0;
-float cutoffThreshold = 0.0;
-unsigned long chargeStartTime = 0;
-unsigned long chargeElapsedTime = 0;
-bool monitoring = false;
-bool outputEnabled = true;
-bool chargingComplete = false;
-
-// Button debouncing and long press detection
-bool lastButtonState = LOW;
-bool buttonState = LOW;
-unsigned long lastDebounceTime = 0;
-unsigned long buttonPressStartTime = 0;
-bool buttonPressHandled = false;
-const unsigned long DEBOUNCE_DELAY = 50;
-const unsigned long LONG_PRESS_TIME = 1000;  // 1 seconds
-
-// Multi-resolution data storage
-struct DataPoint {
-  unsigned long timestamp;
-  float current;
-};
-
-// Three buffers with different resolutions
-#define RECENT_POINTS 100      // Last 100 seconds at 1s resolution
-#define MEDIUM_POINTS 60       // Last hour at 1min resolution (after first 100s)
-#define LONG_POINTS 100        // Remaining time at smart intervals
-
-DataPoint recentData[RECENT_POINTS];
-DataPoint mediumData[MEDIUM_POINTS];
-DataPoint longData[LONG_POINTS];
-
-int recentIndex = 0;
-int mediumIndex = 0;
-int longIndex = 0;
+// ============ END WIFI BACKGROUND TICK ============
 
 void loadSettings() {
   preferences.begin("usbmon", false);
   ADC_OVERSAMPLING = preferences.getInt("oversampling", 32);
   ADC_SMOOTHING = preferences.getFloat("smoothing", 0.1);
   preferences.end();
-  
   Serial.println("=== Settings Loaded ===");
-  Serial.print("ADC Oversampling: ");
-  Serial.println(ADC_OVERSAMPLING);
-  Serial.print("ADC Smoothing: ");
-  Serial.println(ADC_SMOOTHING, 3);
+  Serial.print("ADC Oversampling: "); Serial.println(ADC_OVERSAMPLING);
+  Serial.print("ADC Smoothing: ");    Serial.println(ADC_SMOOTHING, 3);
 }
 
 void saveSettings() {
@@ -280,48 +260,38 @@ void saveSettings() {
   preferences.putInt("oversampling", ADC_OVERSAMPLING);
   preferences.putFloat("smoothing", ADC_SMOOTHING);
   preferences.end();
-  
   Serial.println("=== Settings Saved ===");
-  Serial.print("ADC Oversampling: ");
-  Serial.println(ADC_OVERSAMPLING);
-  Serial.print("ADC Smoothing: ");
-  Serial.println(ADC_SMOOTHING, 3);
+  Serial.print("ADC Oversampling: "); Serial.println(ADC_OVERSAMPLING);
+  Serial.print("ADC Smoothing: ");    Serial.println(ADC_SMOOTHING, 3);
 }
 
 void setup() {
   Serial.begin(115200);
-  
-  // Load saved settings
+
   loadSettings();
 
-  // Configure pins — do this first so output is in known state immediately
   pinMode(OUTPUT_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT);
-  digitalWrite(OUTPUT_PIN, HIGH);  // Output ON by default
+  digitalWrite(OUTPUT_PIN, HIGH);
 
-  // Initialize monitoring state
   monitoring = false;
   savedCurrent = 0.0;
   cutoffThreshold = 0.0;
   chargingComplete = false;
-  
-  // Configure ADC
-  analogReadResolution(12);  // 12-bit resolution (0-4095)
-  analogSetAttenuation(ADC_0db);   // 0-950mV range, better resolution
-  
-  // Initialize I2C for OLED
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_0db);
+
   Wire.begin(SDA_PIN, SCL_PIN);
-  
-  // Initialize OLED
-  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
     Serial.println(F("SSD1306 allocation failed"));
     while(1);
   }
-  
-  // Clear and show startup screen immediately — no WiFi wait
+
   display.clearDisplay();
   display.display();
-  delay(100);  // Let it settle
+  delay(100);
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
@@ -329,33 +299,25 @@ void setup() {
   display.println(F("WiFi: connecting..."));
   display.display();
 
-  // WiFi connects in the background — setup() returns immediately after this
-  // wifiBackgroundTick() will be called from loop()
-
+  // WiFi connects in the background via wifiBackgroundTick() in loop()
   chargeStartTime = millis();
 }
 
 void loop() {
-  // --- Background WiFi / networking state machine ---
-  // Advance one step per loop iteration (non-blocking except WIFI_STATE_CONNECTED
-  // which does a small burst of one-time setup).
   static unsigned long lastWifiTick = 0;
-  // Tick the WiFi state machine at most every 500ms to keep loop fast,
-  // except during READY state where we only need to poll for disconnect.
   unsigned long now = millis();
   bool shouldTickWifi = false;
 
   if (wifiState == WIFI_STATE_IDLE) {
-    // Respect retry delay
     if (wifiRetryTime == 0 || (now - wifiRetryTime >= WIFI_RETRY_INTERVAL)) {
       shouldTickWifi = true;
     }
   } else if (wifiState == WIFI_STATE_CONNECTING) {
-    if (now - lastWifiTick >= 200) shouldTickWifi = true;   // Poll quickly
+    if (now - lastWifiTick >= 200) shouldTickWifi = true;
   } else if (wifiState == WIFI_STATE_CONNECTED) {
-    shouldTickWifi = true;  // Run setup immediately once
+    shouldTickWifi = true;
   } else if (wifiState == WIFI_STATE_READY) {
-    if (now - lastWifiTick >= 5000) shouldTickWifi = true;  // Disconnect check every 5s
+    if (now - lastWifiTick >= 5000) shouldTickWifi = true;
   }
 
   if (shouldTickWifi) {
@@ -363,142 +325,102 @@ void loop() {
     wifiBackgroundTick();
   }
 
-  // Handle OTA and web server only when services are up
   if (wifiServicesStarted) {
     ArduinoOTA.handle();
     server.handleClient();
   }
 
-  // Read current from ADC
   if (millis() - lastSampleTime >= SAMPLE_INTERVAL) {
     lastSampleTime = millis();
     currentCurrent = readCurrent();
-    
-    // Store data point for web graph
     if (millis() - lastWebUpdate >= WEB_UPDATE_INTERVAL) {
       lastWebUpdate = millis();
       storeDataPoint(currentCurrent);
     }
   }
-  
-  // Handle button press
+
   handleButton();
-  
-  // Check for cutoff condition
+
   if (monitoring && !chargingComplete) {
     if (currentCurrent <= cutoffThreshold) {
       digitalWrite(OUTPUT_PIN, LOW);
       outputEnabled = false;
       chargingComplete = true;
       chargeElapsedTime = millis() - chargeStartTime;
-      display.invertDisplay(true);  // Invert screen when done
+      display.invertDisplay(true);
     } else {
       chargeElapsedTime = millis() - chargeStartTime;
     }
   }
-  
-  // Update OLED display
+
   updateDisplay();
 }
 
 float readCurrent() {
-  // Oversample: take multiple readings and average them
   long adcSum = 0;
-  
   for(int i = 0; i < ADC_OVERSAMPLING; i++) {
     adcSum += analogRead(ADC_PIN);
-    delayMicroseconds(50);  // Small delay between samples
+    delayMicroseconds(50);
   }
-  
   int adcValue = adcSum / ADC_OVERSAMPLING;
-  
   float voltage = (adcValue / (float)ADC_RESOLUTION) * ADC_REFERENCE_VOLTAGE;
   voltage = voltage / VOLTAGE_GAIN;
   float current = (voltage / SHUNT_RESISTANCE) + CURRENT_OFFSET;
-  
   if (current < 0) current = 0;
-  
-  // Apply exponential moving average for additional smoothing
   if (filteredCurrent == 0.0) {
-    // First reading - initialize
     filteredCurrent = current;
   } else {
     filteredCurrent = (ADC_SMOOTHING * current) + ((1.0 - ADC_SMOOTHING) * filteredCurrent);
   }
-  
   return filteredCurrent;
 }
 
 void handleButton() {
   int reading = digitalRead(BUTTON_PIN);
-  
-  // Debounce
   if (reading != lastButtonState) {
     lastDebounceTime = millis();
   }
-  
   if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
     if (reading != buttonState) {
       buttonState = reading;
-      
-      if (buttonState == HIGH) {  
-        // Button just pressed - start timing
+      if (buttonState == HIGH) {
         buttonPressStartTime = millis();
         buttonPressHandled = false;
       } else {
-        // Button released
         unsigned long pressDuration = millis() - buttonPressStartTime;
-        
-        // SHORT PRESS: Toggle output on/off
         if (pressDuration < LONG_PRESS_TIME && !buttonPressHandled) {
           outputEnabled = !outputEnabled;
           digitalWrite(OUTPUT_PIN, outputEnabled ? HIGH : LOW);
-          display.invertDisplay(!outputEnabled);  // Invert when off
-          
-          // Reset monitoring when turning output back ON
+          display.invertDisplay(!outputEnabled);
           if (outputEnabled) {
             monitoring = false;
             savedCurrent = 0.0;
             cutoffThreshold = 0.0;
             chargingComplete = false;
           }
-          
           Serial.print("Output toggled: ");
           Serial.println(outputEnabled ? "ON" : "OFF");
         }
-        
         buttonPressHandled = false;
       }
     }
-    
-    // Check for LONG PRESS (2 seconds) while button is still held
     if (buttonState == HIGH && !buttonPressHandled) {
       if (millis() - buttonPressStartTime >= LONG_PRESS_TIME) {
-        // Long press detected - set or reset monitoring
         savedCurrent = currentCurrent;
         cutoffThreshold = savedCurrent * CUTOFF_PERCENTAGE;
         monitoring = true;
-        chargingComplete = false;  // Reset if starting over
+        chargingComplete = false;
         chargeStartTime = millis();
         chargeElapsedTime = 0;
-        
-        // Ensure output is ON when starting monitoring
         if (!outputEnabled) {
           outputEnabled = true;
           digitalWrite(OUTPUT_PIN, HIGH);
-          display.invertDisplay(false);  // Un-invert screen
+          display.invertDisplay(false);
         }
-        
-        buttonPressHandled = true;  // Prevent multiple triggers and short press on release
-        
+        buttonPressHandled = true;
         Serial.println("=== Long Press - Monitoring Set ===");
-        Serial.print("Saved current: ");
-        Serial.print(savedCurrent, 2);
-        Serial.print("A, Cutoff at: ");
-        Serial.print(cutoffThreshold, 2);
-        Serial.println("A");
-        
-        // Brief OLED feedback
+        Serial.print("Saved current: "); Serial.print(savedCurrent, 2);
+        Serial.print("A, Cutoff at: ");  Serial.print(cutoffThreshold, 2); Serial.println("A");
         display.clearDisplay();
         display.setTextSize(2);
         display.setCursor(0, 0);
@@ -514,66 +436,42 @@ void handleButton() {
       }
     }
   }
-  
   lastButtonState = reading;
 }
 
 void updateDisplay() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-  
-  // Top labels (small text)
   display.setTextSize(1);
-  
-  // Left label - left justified
   display.setCursor(0, 0);
   display.print("Current");
-  
-  // Right label - right justified
-  // "Cutoff" is 6 chars * 6 pixels = 36 pixels wide
   display.setCursor(SCREEN_WIDTH - 36, 0);
   display.print("Cutoff");
-  
-  // Current readings (large text, side by side)
   display.setTextSize(2);
-  
-  // Left side - Current reading (left justified)
   display.setCursor(0, 8);
   display.print(currentCurrent, 2);
   display.print("A");
-  
-  // Right side - Cutoff value (right justified)
   char cutoffStr[8];
   if (monitoring) {
-    // Format the cutoff string
     dtostrf(cutoffThreshold, 1, 2, cutoffStr);
     strcat(cutoffStr, "A");
   } else {
     strcpy(cutoffStr, "--");
   }
-  // Each size-2 char is 12 pixels wide
   int cutoffWidth = strlen(cutoffStr) * 12;
   display.setCursor(SCREEN_WIDTH - cutoffWidth, 8);
   display.print(cutoffStr);
-  
-  // Bottom - Time (centered)
   display.setTextSize(1);
   unsigned long displayTime = chargingComplete ? chargeElapsedTime : (millis() - chargeStartTime);
   unsigned long seconds = displayTime / 1000;
   unsigned long minutes = seconds / 60;
   unsigned long hours = minutes / 60;
-  
   char timeStr[12];
   sprintf(timeStr, "%02lu:%02lu:%02lu", hours, minutes % 60, seconds % 60);
-  
-  // Center the time string (each char is 6 pixels wide in size 1)
   int timeWidth = strlen(timeStr) * 6;
   int xPos = (SCREEN_WIDTH - timeWidth) / 2;
-  
   display.setCursor(xPos, 24);
   display.print(timeStr);
-  
-  // Status indicator on far right of time line
   if (chargingComplete) {
     display.setCursor(104, 24);
     display.print("DONE");
@@ -581,17 +479,11 @@ void updateDisplay() {
     display.setCursor(110, 24);
     display.print("OFF");
   }
-
-  // Small WiFi status indicator — bottom-left corner, only when not yet ready
+  // Small WiFi status indicator, bottom-left, disappears once ready
   if (wifiState != WIFI_STATE_READY) {
     display.setCursor(0, 24);
-    if (wifiState == WIFI_STATE_CONNECTING) {
-      display.print("W..");   // "WiFi connecting"
-    } else {
-      display.print("W?");    // Disconnected / retrying
-    }
+    display.print(wifiState == WIFI_STATE_CONNECTING ? "W.." : "W?");
   }
-  
   display.display();
 }
 
@@ -606,63 +498,47 @@ void handleGetSettings() {
 void handleSetSettings() {
   if (server.hasArg("oversampling")) {
     int newOversampling = server.arg("oversampling").toInt();
-    if (newOversampling >= 1 && newOversampling <= 64) {
-      ADC_OVERSAMPLING = newOversampling;
-    }
+    if (newOversampling >= 1 && newOversampling <= 64) ADC_OVERSAMPLING = newOversampling;
   }
-  
   if (server.hasArg("smoothing")) {
     float newSmoothing = server.arg("smoothing").toFloat();
     if (newSmoothing >= 0.0 && newSmoothing <= 1.0) {
       ADC_SMOOTHING = newSmoothing;
-      // Reset filtered value when smoothing changes
       filteredCurrent = 0.0;
     }
   }
-  
   saveSettings();
-  handleGetSettings();  // Return updated settings
+  handleGetSettings();
 }
 
 void handleToggleOutput() {
   outputEnabled = !outputEnabled;
   digitalWrite(OUTPUT_PIN, outputEnabled ? HIGH : LOW);
   display.invertDisplay(!outputEnabled);
-  
-  // Reset monitoring when turning output back ON
   if (outputEnabled) {
     monitoring = false;
     savedCurrent = 0.0;
     cutoffThreshold = 0.0;
     chargingComplete = false;
   }
-  
   Serial.print("Web toggle - Output: ");
   Serial.println(outputEnabled ? "ON" : "OFF");
-  
-  handleCurrent();  // Return current status
+  handleCurrent();
 }
 
 void storeDataPoint(float current) {
   unsigned long now = millis();
-  
-  // Always store in recent buffer (1 second resolution)
   recentData[recentIndex].timestamp = now;
   recentData[recentIndex].current = current;
   recentIndex = (recentIndex + 1) % RECENT_POINTS;
-  
-  // Store in medium buffer every 60 seconds (1 minute resolution)
   if (now - lastMediumStore >= 60000) {
     mediumData[mediumIndex].timestamp = now;
     mediumData[mediumIndex].current = current;
     mediumIndex = (mediumIndex + 1) % MEDIUM_POINTS;
     lastMediumStore = now;
   }
-  
-  // Store in long buffer at smart intervals based on elapsed time
   unsigned long elapsed = now - chargeStartTime;
-  unsigned long longInterval = max(120000UL, elapsed / LONG_POINTS);  // At least 2 minutes
-  
+  unsigned long longInterval = max(120000UL, elapsed / LONG_POINTS);
   if (now - lastLongStore >= longInterval) {
     longData[longIndex].timestamp = now;
     longData[longIndex].current = current;
@@ -671,7 +547,6 @@ void storeDataPoint(float current) {
   }
 }
 
-// Web server handlers
 void handleRoot() {
   server.send(200, "text/html", getIndexHTML());
 }
@@ -690,52 +565,41 @@ void handleCurrent() {
 
 void handleHistory() {
   unsigned long now = millis();
-  unsigned long recentCutoff = now - 100000;    // Last 100 seconds
-  unsigned long mediumCutoff = now - 3700000;   // Last ~1 hour
-  
+  unsigned long recentCutoff = now - 100000;
+  unsigned long mediumCutoff = now - 3700000;
   String json = "[";
   bool first = true;
-  
-  // Add long-term data (oldest, sparsest)
   for (int i = 0; i < LONG_POINTS; i++) {
     int idx = (longIndex + i) % LONG_POINTS;
     if (longData[idx].timestamp > 0 && longData[idx].timestamp < mediumCutoff) {
       if (!first) json += ",";
       first = false;
-      json += "{\"t\":" + String(longData[idx].timestamp) + ",";
-      json += "\"c\":" + String(longData[idx].current, 3) + "}";
+      json += "{\"t\":" + String(longData[idx].timestamp) + ",\"c\":" + String(longData[idx].current, 3) + "}";
     }
   }
-  
-  // Add medium resolution data (last hour, 1min intervals)
   for (int i = 0; i < MEDIUM_POINTS; i++) {
     int idx = (mediumIndex + i) % MEDIUM_POINTS;
-    if (mediumData[idx].timestamp > 0 && 
-        mediumData[idx].timestamp >= mediumCutoff && 
+    if (mediumData[idx].timestamp > 0 &&
+        mediumData[idx].timestamp >= mediumCutoff &&
         mediumData[idx].timestamp < recentCutoff) {
       if (!first) json += ",";
       first = false;
-      json += "{\"t\":" + String(mediumData[idx].timestamp) + ",";
-      json += "\"c\":" + String(mediumData[idx].current, 3) + "}";
+      json += "{\"t\":" + String(mediumData[idx].timestamp) + ",\"c\":" + String(mediumData[idx].current, 3) + "}";
     }
   }
-  
-  // Add recent high-resolution data (last 100 seconds, 1s intervals)
   for (int i = 0; i < RECENT_POINTS; i++) {
     int idx = (recentIndex + i) % RECENT_POINTS;
     if (recentData[idx].timestamp > 0 && recentData[idx].timestamp >= recentCutoff) {
       if (!first) json += ",";
       first = false;
-      json += "{\"t\":" + String(recentData[idx].timestamp) + ",";
-      json += "\"c\":" + String(recentData[idx].current, 3) + "}";
+      json += "{\"t\":" + String(recentData[idx].timestamp) + ",\"c\":" + String(recentData[idx].current, 3) + "}";
     }
   }
-  
   json += "]";
   server.send(200, "application/json", json);
 }
 
-void dummyTest() { }  // Test function
+void dummyTest() { }
 
 String getIndexHTML() {
   String html = R"rawliteral(<!DOCTYPE HTML><html>
@@ -787,14 +651,14 @@ String getIndexHTML() {
     <div class="setting-row">
       <div style="flex: 2;">
         <div class="setting-label">Oversampling</div>
-        <div class="setting-desc">Number of ADC samples to average (1-64). Higher = smoother but slower. Set to 1 to disable.</div>
+        <div class="setting-desc">Number of ADC samples to average (1-64). Higher = smoother but slower.</div>
       </div>
       <input type="number" id="oversampling" class="setting-input" min="1" max="64" value="32">
     </div>
     <div class="setting-row">
       <div style="flex: 2;">
         <div class="setting-label">Smoothing Factor</div>
-        <div class="setting-desc">Exponential moving average (0.0-1.0). Lower = smoother. 0.0 disables, 1.0 = no smoothing.</div>
+        <div class="setting-desc">Exponential moving average (0.0-1.0). Lower = smoother.</div>
       </div>
       <input type="number" id="smoothing" class="setting-input" min="0" max="1" step="0.01" value="0.10">
     </div>
@@ -803,41 +667,23 @@ String getIndexHTML() {
   </div>
 </body>
 <script>
-// Global variable to track the latest timestamp from the device
 var latestTime = 0;
-
 var chart = new Highcharts.Chart({
-  chart: { 
-    renderTo: 'chart-current',
-    zoomType: 'x'
-  },
+  chart: { renderTo: 'chart-current', zoomType: 'x' },
   title: { text: 'USB Current Over Time' },
-  series: [{
-    name: 'Current',
-    showInLegend: false,
-    data: [],
-    turboThreshold: 0
-  }],
+  series: [{ name: 'Current', showInLegend: false, data: [], turboThreshold: 0 }],
   plotOptions: {
-    line: { 
-      animation: false,
-      dataLabels: { enabled: false },
-      marker: { enabled: false }
-    },
+    line: { animation: false, dataLabels: { enabled: false }, marker: { enabled: false } },
     series: { color: '#059e8a' }
   },
-  xAxis: { 
-    type: 'linear',  // Linear axis for raw milliseconds
+  xAxis: {
+    type: 'linear',
     title: { text: 'Time Ago' },
-    reversed: false, // Standard left-to-right time
     labels: {
       formatter: function() {
         if (latestTime === 0) return "";
-        
-        // Calculate difference from latest known time
         const diffMs = latestTime - this.value;
         const secondsAgo = Math.floor(diffMs / 1000);
-        
         if (secondsAgo < 5) return "Now";
         if (secondsAgo < 60) return "-" + secondsAgo + "s";
         if (secondsAgo < 3600) return "-" + Math.floor(secondsAgo/60) + "m";
@@ -845,125 +691,78 @@ var chart = new Highcharts.Chart({
       }
     }
   },
-  yAxis: {
-    title: { text: 'Current (A)' },
-    min: 0,
-    minRange: 0.3
-  },
+  yAxis: { title: { text: 'Current (A)' }, min: 0, minRange: 0.3 },
   credits: { enabled: false },
   tooltip: {
     formatter: function() {
       const diffMs = latestTime - this.x;
       const secondsAgo = Math.floor(diffMs / 1000);
       let timeLabel = "Now";
-      
       if (secondsAgo >= 60) {
-        const mins = Math.floor(secondsAgo / 60);
-        const secs = secondsAgo % 60;
-        timeLabel = "-" + mins + "m " + secs + "s";
+        timeLabel = "-" + Math.floor(secondsAgo/60) + "m " + (secondsAgo%60) + "s";
       } else if (secondsAgo > 0) {
         timeLabel = "-" + secondsAgo + "s";
       }
-      
-      return '<b>' + timeLabel + '</b><br/>' +
-             'Current: ' + this.y.toFixed(2) + ' A';
+      return '<b>' + timeLabel + '</b><br/>Current: ' + this.y.toFixed(2) + ' A';
     }
   }
 });
 
-// Function to load full history
 function loadHistory() {
-  fetch('/history')
-    .then(response => response.json())
-    .then(data => {
-      if (data.length > 0) {
-        // Sort data by timestamp
-        data.sort((a, b) => a.t - b.t);
-        
-        // Update latestTime from the newest data point
-        latestTime = data[data.length - 1].t;
-        
-        // Convert to Highcharts format [timestamp, value]
-        const chartData = data.map(point => [point.t, point.c]);
-        
-        chart.series[0].setData(chartData, true, false, false);
-      }
-    });
+  fetch('/history').then(r => r.json()).then(data => {
+    if (data.length > 0) {
+      data.sort((a, b) => a.t - b.t);
+      latestTime = data[data.length - 1].t;
+      chart.series[0].setData(data.map(p => [p.t, p.c]), true, false, false);
+    }
+  });
 }
-
-// Initial load
 loadHistory();
 
-// Update loop
 setInterval(function() {
-  fetch('/current')
-    .then(response => response.json())
-    .then(data => {
-      // Update text stats
-      document.getElementById('currentValue').innerText = data.current.toFixed(2);
-      
-      if(data.monitoring && data.cutoff > 0) {
-        document.getElementById('cutoffValue').innerText = data.cutoff.toFixed(2);
-        document.getElementById('cutoffValue').style.color = '#059e8a';
-      } else {
-        document.getElementById('cutoffValue').innerText = '--';
-        document.getElementById('cutoffValue').style.color = '#ccc';
-      }
-      
-      let seconds = Math.floor(data.elapsed / 1000);
-      let minutes = Math.floor(seconds / 60);
-      let hours = Math.floor(minutes / 60);
-      let timeStr = String(hours).padStart(2, '0') + ':' + 
-                    String(minutes % 60).padStart(2, '0') + ':' + 
-                    String(seconds % 60).padStart(2, '0');
-      document.getElementById('timeValue').innerText = timeStr;
-      document.getElementById('statusValue').innerText = data.output ? 'ON' : 'OFF';
-      
-      // Update global latestTime
-      latestTime = data.time;
-      
-      // Update Chart
-      const series = chart.series[0];
-      const shift = series.data.length > 1000; 
-      series.addPoint([data.time, data.current], true, shift, false);
-    });
+  fetch('/current').then(r => r.json()).then(data => {
+    document.getElementById('currentValue').innerText = data.current.toFixed(2);
+    if (data.monitoring && data.cutoff > 0) {
+      document.getElementById('cutoffValue').innerText = data.cutoff.toFixed(2);
+      document.getElementById('cutoffValue').style.color = '#059e8a';
+    } else {
+      document.getElementById('cutoffValue').innerText = '--';
+      document.getElementById('cutoffValue').style.color = '#ccc';
+    }
+    let s = Math.floor(data.elapsed/1000), m = Math.floor(s/60), h = Math.floor(m/60);
+    document.getElementById('timeValue').innerText =
+      String(h).padStart(2,'0')+':'+String(m%60).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+    document.getElementById('statusValue').innerText = data.output ? 'ON' : 'OFF';
+    latestTime = data.time;
+    const series = chart.series[0];
+    series.addPoint([data.time, data.current], true, series.data.length > 1000, false);
+  });
 }, 1000);
 
-// Refresh full history every minute
 setInterval(loadHistory, 60000);
 
 function toggleOutput() {
-  fetch('/toggle', {method: 'POST'})
-    .then(response => response.json())
-    .then(data => {
-      document.getElementById('statusValue').innerText = data.output ? 'ON' : 'OFF';
-    });
+  fetch('/toggle', {method:'POST'}).then(r => r.json()).then(data => {
+    document.getElementById('statusValue').innerText = data.output ? 'ON' : 'OFF';
+  });
 }
 
 function saveSettings() {
-  const oversampling = document.getElementById('oversampling').value;
-  const smoothing = document.getElementById('smoothing').value;
   const params = new URLSearchParams();
-  params.append('oversampling', oversampling);
-  params.append('smoothing', smoothing);
-  fetch('/settings', {method: 'POST', body: params})
-    .then(response => response.json())
-    .then(data => {
-      document.getElementById('successMsg').style.display = 'block';
-      setTimeout(() => { document.getElementById('successMsg').style.display = 'none'; }, 3000);
-    });
+  params.append('oversampling', document.getElementById('oversampling').value);
+  params.append('smoothing', document.getElementById('smoothing').value);
+  fetch('/settings', {method:'POST', body:params}).then(r => r.json()).then(() => {
+    document.getElementById('successMsg').style.display = 'block';
+    setTimeout(() => { document.getElementById('successMsg').style.display = 'none'; }, 3000);
+  });
 }
 
-// Load current settings on page load
-fetch('/settings')
-  .then(response => response.json())
-  .then(data => {
-    document.getElementById('oversampling').value = data.oversampling;
-    document.getElementById('smoothing').value = data.smoothing;
-  });
+fetch('/settings').then(r => r.json()).then(data => {
+  document.getElementById('oversampling').value = data.oversampling;
+  document.getElementById('smoothing').value = data.smoothing;
+});
 </script>
 </html>
 )rawliteral";
-
   return html;
 }

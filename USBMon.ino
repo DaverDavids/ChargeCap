@@ -2,6 +2,10 @@
  * ESP32-C3 USB Charge Monitor
  * - OTA updates enabled
  * - mDNS hostname: usbmon.local
+ *
+ * Boot strategy: Core functions (OLED, button, ADC, output pin) initialize
+ * immediately. WiFi, mDNS, OTA, and WebServer connect in the background via
+ * a state machine in loop(). The display is usable within ~200ms of power-on.
  */
 
 #include <WiFi.h>
@@ -60,6 +64,163 @@ const int OLED_ADDRESS = 0x3C;  // Try 0x3D instead of 0x3C
 
 // ============ END CONFIGURABLE PARAMETERS ============
 
+// ============ WIFI BACKGROUND STATE MACHINE ============
+// WiFi/networking initializes in the background so core boots instantly.
+enum WifiState {
+  WIFI_STATE_IDLE,        // Not started yet
+  WIFI_STATE_CONNECTING,  // WiFi.begin() called, waiting for connection
+  WIFI_STATE_CONNECTED,   // WiFi connected, setting up services
+  WIFI_STATE_READY        // All services running
+};
+
+WifiState wifiState = WIFI_STATE_IDLE;
+unsigned long wifiStartTime = 0;
+const unsigned long WIFI_TIMEOUT_MS = 20000;  // Give up after 20s, retry later
+unsigned long wifiRetryTime = 0;
+const unsigned long WIFI_RETRY_INTERVAL = 30000; // Retry every 30s if failed
+bool wifiServicesStarted = false;
+
+void wifiBackgroundTick() {
+  switch (wifiState) {
+
+    case WIFI_STATE_IDLE:
+      // Start connecting
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(MYSSID, MYPSK);
+      wifiStartTime = millis();
+      wifiState = WIFI_STATE_CONNECTING;
+      Serial.println("WiFi: connecting in background...");
+      break;
+
+    case WIFI_STATE_CONNECTING:
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+        wifiState = WIFI_STATE_CONNECTED;
+      } else if (millis() - wifiStartTime > WIFI_TIMEOUT_MS) {
+        Serial.println("\nWiFi: timed out, will retry later");
+        WiFi.disconnect(true);
+        wifiRetryTime = millis();
+        wifiState = WIFI_STATE_IDLE;  // Re-arm for retry below
+        // Prevent immediate re-trigger — handled by retry guard in loop
+      }
+      break;
+
+    case WIFI_STATE_CONNECTED:
+      // Setup mDNS
+      if (!MDNS.begin(MDNS_HOSTNAME)) {
+        Serial.println("Error setting up mDNS responder!");
+      } else {
+        Serial.print("mDNS responder started: http://");
+        Serial.print(MDNS_HOSTNAME);
+        Serial.println(".local");
+        MDNS.addService("http", "tcp", 80);
+      }
+
+      // Setup OTA
+      ArduinoOTA.setHostname(MDNS_HOSTNAME);
+
+      ArduinoOTA.onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH) {
+          type = "sketch";
+        } else {
+          type = "filesystem";
+        }
+        Serial.println("Start updating " + type);
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("OTA Update");
+        display.println("Starting...");
+        display.display();
+      });
+
+      ArduinoOTA.onEnd([]() {
+        Serial.println("\nEnd");
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("OTA Update");
+        display.println("Complete!");
+        display.display();
+      });
+
+      ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        unsigned int percent = (progress / (total / 100));
+        Serial.printf("Progress: %u%%\r", percent);
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("OTA Update");
+        display.setCursor(0, 16);
+        display.print("Progress: ");
+        display.print(percent);
+        display.println("%");
+        display.display();
+      });
+
+      ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR) {
+          Serial.println("Auth Failed");
+        } else if (error == OTA_BEGIN_ERROR) {
+          Serial.println("Begin Failed");
+        } else if (error == OTA_CONNECT_ERROR) {
+          Serial.println("Connect Failed");
+        } else if (error == OTA_RECEIVE_ERROR) {
+          Serial.println("Receive Failed");
+        } else if (error == OTA_END_ERROR) {
+          Serial.println("End Failed");
+        }
+      });
+
+      ArduinoOTA.begin();
+
+      // Setup web server routes
+      server.on("/", HTTP_GET, handleRoot);
+      server.on("/current", HTTP_GET, handleCurrent);
+      server.on("/history", HTTP_GET, handleHistory);
+      server.on("/settings", HTTP_GET, handleGetSettings);
+      server.on("/settings", HTTP_POST, handleSetSettings);
+      server.on("/toggle", HTTP_POST, handleToggleOutput);
+
+      server.on("/debug", HTTP_GET, [](){
+        String html = "<html><body><h2>Data Buffer Status</h2>";
+        html += "<p>Uptime: " + String(millis() / 1000) + " seconds</p>";
+        html += "<p>Recent buffer: " + String(recentIndex) + " / " + String(RECENT_POINTS) + "</p>";
+        html += "<p>Medium buffer: " + String(mediumIndex) + " / " + String(MEDIUM_POINTS) + "</p>";
+        html += "<p>Long buffer: " + String(longIndex) + " / " + String(LONG_POINTS) + "</p>";
+        html += "<h3>Recent Data (last 10):</h3><ul>";
+        for(int i = 0; i < 10; i++) {
+          int idx = (recentIndex - 10 + i + RECENT_POINTS) % RECENT_POINTS;
+          if(recentData[idx].timestamp > 0) {
+            html += "<li>Time: " + String(recentData[idx].timestamp/1000) + "s, Current: " + String(recentData[idx].current, 2) + "A</li>";
+          }
+        }
+        html += "</ul></body></html>";
+        server.send(200, "text/html", html);
+      });
+
+      server.begin();
+      wifiServicesStarted = true;
+      wifiState = WIFI_STATE_READY;
+      Serial.println("WiFi services ready.");
+      break;
+
+    case WIFI_STATE_READY:
+      // Check for unexpected disconnection and re-arm
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi: lost connection, will reconnect...");
+        wifiServicesStarted = false;
+        wifiRetryTime = millis();
+        wifiState = WIFI_STATE_IDLE;
+      }
+      break;
+  }
+}
+// ============ END WIFI STATE MACHINE ============
+
 // Global variables
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 WebServer server(80);
@@ -101,8 +262,6 @@ int recentIndex = 0;
 int mediumIndex = 0;
 int longIndex = 0;
 
-// Remove old globals: dataPoints, dataIndex, MAX_DATA_POINTS
-
 void loadSettings() {
   preferences.begin("usbmon", false);
   ADC_OVERSAMPLING = preferences.getInt("oversampling", 32);
@@ -135,7 +294,7 @@ void setup() {
   // Load saved settings
   loadSettings();
 
-  // Configure pins
+  // Configure pins — do this first so output is in known state immediately
   pinMode(OUTPUT_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT);
   digitalWrite(OUTPUT_PIN, HIGH);  // Output ON by default
@@ -159,7 +318,7 @@ void setup() {
     while(1);
   }
   
-  // IMPORTANT: Clear the buffer immediately
+  // Clear and show startup screen immediately — no WiFi wait
   display.clearDisplay();
   display.display();
   delay(100);  // Let it settle
@@ -167,139 +326,49 @@ void setup() {
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   display.println(F("USB Monitor"));
-  display.println(F("Connecting WiFi..."));
+  display.println(F("WiFi: connecting..."));
   display.display();
-  
-  // Connect to WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(MYSSID, MYPSK);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  
-  Serial.println("\nWiFi connected");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-  
-  // Setup mDNS
-  if (!MDNS.begin(MDNS_HOSTNAME)) {
-    Serial.println("Error setting up mDNS responder!");
-  } else {
-    Serial.print("mDNS responder started: http://");
-    Serial.print(MDNS_HOSTNAME);
-    Serial.println(".local");
-    MDNS.addService("http", "tcp", 80);
-  }
-  
-  // Setup OTA
-  ArduinoOTA.setHostname(MDNS_HOSTNAME);
-  
-  ArduinoOTA.onStart([]() {
-    String type;
-    if (ArduinoOTA.getCommand() == U_FLASH) {
-      type = "sketch";
-    } else {  // U_SPIFFS
-      type = "filesystem";
-    }
-    Serial.println("Start updating " + type);
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.println("OTA Update");
-    display.println("Starting...");
-    display.display();
-  });
-  
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("OTA Update");
-    display.println("Complete!");
-    display.display();
-  });
-  
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    unsigned int percent = (progress / (total / 100));
-    Serial.printf("Progress: %u%%\r", percent);
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.println("OTA Update");
-    display.setCursor(0, 16);
-    display.print("Progress: ");
-    display.print(percent);
-    display.println("%");
-    display.display();
-  });
-  
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) {
-      Serial.println("Auth Failed");
-    } else if (error == OTA_BEGIN_ERROR) {
-      Serial.println("Begin Failed");
-    } else if (error == OTA_CONNECT_ERROR) {
-      Serial.println("Connect Failed");
-    } else if (error == OTA_RECEIVE_ERROR) {
-      Serial.println("Receive Failed");
-    } else if (error == OTA_END_ERROR) {
-      Serial.println("End Failed");
-    }
-  });
-  
-  ArduinoOTA.begin();
-  
-  // Display IP and hostname on OLED
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println(F("WiFi Connected"));
-  display.print(MDNS_HOSTNAME);
-  display.println(".local");
-  display.print(F("IP: "));
-  display.println(WiFi.localIP());
-  display.display();
-  delay(2000);
-  
-  // Setup web server routes
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/current", HTTP_GET, handleCurrent);
-  server.on("/history", HTTP_GET, handleHistory);
-  server.on("/settings", HTTP_GET, handleGetSettings);
-  server.on("/settings", HTTP_POST, handleSetSettings);
-  server.on("/toggle", HTTP_POST, handleToggleOutput);
-  
-  server.on("/debug", HTTP_GET, [](){
-    String html = "<html><body><h2>Data Buffer Status</h2>";
-    html += "<p>Uptime: " + String(millis() / 1000) + " seconds</p>";
-    html += "<p>Recent buffer: " + String(recentIndex) + " / " + String(RECENT_POINTS) + "</p>";
-    html += "<p>Medium buffer: " + String(mediumIndex) + " / " + String(MEDIUM_POINTS) + "</p>";
-    html += "<p>Long buffer: " + String(longIndex) + " / " + String(LONG_POINTS) + "</p>";
-    
-    html += "<h3>Recent Data (last 10):</h3><ul>";
-    for(int i = 0; i < 10; i++) {
-      int idx = (recentIndex - 10 + i + RECENT_POINTS) % RECENT_POINTS;
-      if(recentData[idx].timestamp > 0) {
-        html += "<li>Time: " + String(recentData[idx].timestamp/1000) + "s, Current: " + String(recentData[idx].current, 2) + "A</li>";
-      }
-    }
-    html += "</ul></body></html>";
-    server.send(200, "text/html", html);
-  });
-  
-  server.begin();
-  
+
+  // WiFi connects in the background — setup() returns immediately after this
+  // wifiBackgroundTick() will be called from loop()
+
   chargeStartTime = millis();
 }
 
 void loop() {
-  // Handle OTA updates
-  ArduinoOTA.handle();
-  
-  // Handle web server requests
-  server.handleClient();
-  
+  // --- Background WiFi / networking state machine ---
+  // Advance one step per loop iteration (non-blocking except WIFI_STATE_CONNECTED
+  // which does a small burst of one-time setup).
+  static unsigned long lastWifiTick = 0;
+  // Tick the WiFi state machine at most every 500ms to keep loop fast,
+  // except during READY state where we only need to poll for disconnect.
+  unsigned long now = millis();
+  bool shouldTickWifi = false;
+
+  if (wifiState == WIFI_STATE_IDLE) {
+    // Respect retry delay
+    if (wifiRetryTime == 0 || (now - wifiRetryTime >= WIFI_RETRY_INTERVAL)) {
+      shouldTickWifi = true;
+    }
+  } else if (wifiState == WIFI_STATE_CONNECTING) {
+    if (now - lastWifiTick >= 200) shouldTickWifi = true;   // Poll quickly
+  } else if (wifiState == WIFI_STATE_CONNECTED) {
+    shouldTickWifi = true;  // Run setup immediately once
+  } else if (wifiState == WIFI_STATE_READY) {
+    if (now - lastWifiTick >= 5000) shouldTickWifi = true;  // Disconnect check every 5s
+  }
+
+  if (shouldTickWifi) {
+    lastWifiTick = now;
+    wifiBackgroundTick();
+  }
+
+  // Handle OTA and web server only when services are up
+  if (wifiServicesStarted) {
+    ArduinoOTA.handle();
+    server.handleClient();
+  }
+
   // Read current from ADC
   if (millis() - lastSampleTime >= SAMPLE_INTERVAL) {
     lastSampleTime = millis();
@@ -512,6 +581,16 @@ void updateDisplay() {
     display.setCursor(110, 24);
     display.print("OFF");
   }
+
+  // Small WiFi status indicator — bottom-left corner, only when not yet ready
+  if (wifiState != WIFI_STATE_READY) {
+    display.setCursor(0, 24);
+    if (wifiState == WIFI_STATE_CONNECTING) {
+      display.print("W..");   // "WiFi connecting"
+    } else {
+      display.print("W?");    // Disconnected / retrying
+    }
+  }
   
   display.display();
 }
@@ -581,7 +660,6 @@ void storeDataPoint(float current) {
   }
   
   // Store in long buffer at smart intervals based on elapsed time
-  // This spreads data across the entire time period
   unsigned long elapsed = now - chargeStartTime;
   unsigned long longInterval = max(120000UL, elapsed / LONG_POINTS);  // At least 2 minutes
   
@@ -853,6 +931,36 @@ setInterval(function() {
 
 // Refresh full history every minute
 setInterval(loadHistory, 60000);
+
+function toggleOutput() {
+  fetch('/toggle', {method: 'POST'})
+    .then(response => response.json())
+    .then(data => {
+      document.getElementById('statusValue').innerText = data.output ? 'ON' : 'OFF';
+    });
+}
+
+function saveSettings() {
+  const oversampling = document.getElementById('oversampling').value;
+  const smoothing = document.getElementById('smoothing').value;
+  const params = new URLSearchParams();
+  params.append('oversampling', oversampling);
+  params.append('smoothing', smoothing);
+  fetch('/settings', {method: 'POST', body: params})
+    .then(response => response.json())
+    .then(data => {
+      document.getElementById('successMsg').style.display = 'block';
+      setTimeout(() => { document.getElementById('successMsg').style.display = 'none'; }, 3000);
+    });
+}
+
+// Load current settings on page load
+fetch('/settings')
+  .then(response => response.json())
+  .then(data => {
+    document.getElementById('oversampling').value = data.oversampling;
+    document.getElementById('smoothing').value = data.smoothing;
+  });
 </script>
 </html>
 )rawliteral";

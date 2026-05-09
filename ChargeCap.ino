@@ -1,7 +1,7 @@
 /*
  * ESP32-C3 USB Charge Monitor
  * - OTA updates enabled
- * - mDNS hostname: usbmon.local
+ * - mDNS hostname: chargecap.local
  *
  * Boot strategy: Core functions (OLED, button, ADC, output pin) initialize
  * immediately. WiFi, mDNS, OTA, and WebServer connect in the background via
@@ -19,7 +19,7 @@
 #include <Secrets.h>  // Contains MYSSID and MYPSK
 
 // ============ CONFIGURABLE PARAMETERS ============
-const char* MDNS_HOSTNAME = "usbmon";
+const char* MDNS_HOSTNAME = "chargecap";
 
 const int ADC_PIN = 0;
 const int OUTPUT_PIN = 10;
@@ -125,7 +125,7 @@ void wifiBackgroundTick() {
 
     case WIFI_STATE_IDLE:
       WiFi.mode(WIFI_STA);
-      WiFi.begin(MYSSID, MYPSK);
+      WiFi.begin(MYSSIDIOT, MYPSKIOT);
       wifiStartTime = millis();
       wifiState = WIFI_STATE_CONNECTING;
       Serial.println("WiFi: connecting in background...");

@@ -2,20 +2,16 @@ DISCLAIMER: This code was made with the help of AI/LLMs.
 
 # ChargeCap
 
-A USB inline charge limiter for lithium-ion battery devices. Plug any USB-charged device in through ChargeCap and it will automatically cut power when the battery nears full — protecting battery longevity without any per-device configuration.
-
-## The Problem
-
-Li-ion batteries degrade fastest when left fully charged or fully discharged. Most small devices (power tools, handheld radios, etc.) sit on the shelf 99% of the time — fully charged. ChargeCap solves this passively, for any device, without modifying the device itself.
+A USB inline charge limiter for lithium-ion battery devices. Set the current when you start charging, and the device will cut power when the current has dropped to half.
 
 ## How It Works
 
 ChargeCap exploits the Li-ion charge curve: charge current stays high during bulk charge, then tapers linearly as voltage approaches the cell ceiling (~4.2V/cell). By sampling peak current at the start of a charge cycle and cutting off at a set fraction of that peak (default: 50%), the device stops charging at roughly 80–90% — regardless of pack size or cell count.
 
-- **Long-press button** → samples current peak and sets the cutoff threshold
-- **Short-press button** → toggles output on/off (manual override)
-- **OLED display** → shows live current, cutoff threshold, charge elapsed time, and status
-- **Auto-cutoff** → MOSFET cuts USB power when current drops to threshold; display inverts to signal completion
+- **Long-press button** samples current peak and sets the cutoff threshold
+- **Short-press button** toggles output on/off (manual override)
+- **OLED display** shows live current, cutoff threshold, charge elapsed time, and status
+- **Auto-cutoff** MOSFET cuts USB power when current drops to threshold; display inverts to signal completion
 
 ## Hardware
 

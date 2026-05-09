@@ -1,5 +1,5 @@
 /*
- * ESP32-C3 USB Charge Monitor
+ * ESP32-C3 ChargeCap
  * - OTA updates enabled
  * - mDNS hostname: chargecap.local
  *
@@ -22,10 +22,14 @@
 const char* MDNS_HOSTNAME = "chargecap";
 
 const int ADC_PIN = 0;
-const int OUTPUT_PIN = 10;
 const int BUTTON_PIN = 8;
 const int SDA_PIN = 7;
 const int SCL_PIN = 6;
+
+// OUTPUT_PIN and LONG_PRESS_TIME are now runtime-configurable via the web UI
+// and persisted in NVS. These are the compile-time defaults used on first boot.
+const int DEFAULT_OUTPUT_PIN      = 10;
+const unsigned long DEFAULT_LONG_PRESS_MS = 1000;
 
 const float SHUNT_RESISTANCE = 0.027;
 const float ADC_REFERENCE_VOLTAGE = 0.95;
@@ -38,6 +42,10 @@ Preferences preferences;
 int ADC_OVERSAMPLING = 1;
 float ADC_SMOOTHING = 1.0;
 float filteredCurrent = 0.0;
+
+// Runtime-settable via web UI
+int OUTPUT_PIN = DEFAULT_OUTPUT_PIN;
+unsigned long LONG_PRESS_TIME = DEFAULT_LONG_PRESS_MS;
 
 const float CUTOFF_PERCENTAGE = 0.50;
 const int SAMPLE_INTERVAL = 100;
@@ -90,7 +98,6 @@ unsigned long lastDebounceTime = 0;
 unsigned long buttonPressStartTime = 0;
 bool buttonPressHandled = false;
 const unsigned long DEBOUNCE_DELAY = 50;
-const unsigned long LONG_PRESS_TIME = 1000;
 
 struct DataPoint {
   unsigned long timestamp;
@@ -119,7 +126,6 @@ void handleToggleOutput();
 String getIndexHTML();
 
 // ============ WIFI BACKGROUND TICK ============
-// Called from loop(). All globals are fully declared above, so no forward-ref issues.
 void wifiBackgroundTick() {
   switch (wifiState) {
 
@@ -209,7 +215,6 @@ void wifiBackgroundTick() {
       server.on("/settings", HTTP_POST, handleSetSettings);
       server.on("/toggle", HTTP_POST, handleToggleOutput);
 
-      // [&] capture gives the lambda access to all globals (server, recentIndex, etc.)
       server.on("/debug", HTTP_GET, [&](){
         String html = "<html><body><h2>Data Buffer Status</h2>";
         html += "<p>Uptime: " + String(millis() / 1000) + " seconds</p>";
@@ -246,23 +251,31 @@ void wifiBackgroundTick() {
 // ============ END WIFI BACKGROUND TICK ============
 
 void loadSettings() {
-  preferences.begin("usbmon", false);
+  preferences.begin("chargecap", false);
   ADC_OVERSAMPLING = preferences.getInt("oversampling", 32);
-  ADC_SMOOTHING = preferences.getFloat("smoothing", 0.1);
+  ADC_SMOOTHING    = preferences.getFloat("smoothing", 0.1);
+  OUTPUT_PIN       = preferences.getInt("output_pin", DEFAULT_OUTPUT_PIN);
+  LONG_PRESS_TIME  = (unsigned long)preferences.getInt("long_press_ms", (int)DEFAULT_LONG_PRESS_MS);
   preferences.end();
   Serial.println("=== Settings Loaded ===");
   Serial.print("ADC Oversampling: "); Serial.println(ADC_OVERSAMPLING);
   Serial.print("ADC Smoothing: ");    Serial.println(ADC_SMOOTHING, 3);
+  Serial.print("Output PIN: ");       Serial.println(OUTPUT_PIN);
+  Serial.print("Long Press ms: ");    Serial.println(LONG_PRESS_TIME);
 }
 
 void saveSettings() {
-  preferences.begin("usbmon", false);
+  preferences.begin("chargecap", false);
   preferences.putInt("oversampling", ADC_OVERSAMPLING);
   preferences.putFloat("smoothing", ADC_SMOOTHING);
+  preferences.putInt("output_pin", OUTPUT_PIN);
+  preferences.putInt("long_press_ms", (int)LONG_PRESS_TIME);
   preferences.end();
   Serial.println("=== Settings Saved ===");
   Serial.print("ADC Oversampling: "); Serial.println(ADC_OVERSAMPLING);
   Serial.print("ADC Smoothing: ");    Serial.println(ADC_SMOOTHING, 3);
+  Serial.print("Output PIN: ");       Serial.println(OUTPUT_PIN);
+  Serial.print("Long Press ms: ");    Serial.println(LONG_PRESS_TIME);
 }
 
 void setup() {
@@ -295,7 +308,7 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
-  display.println(F("USB Monitor"));
+  display.println(F("ChargeCap"));
   display.println(F("WiFi: connecting..."));
   display.display();
 
@@ -490,22 +503,39 @@ void updateDisplay() {
 void handleGetSettings() {
   String json = "{";
   json += "\"oversampling\":" + String(ADC_OVERSAMPLING) + ",";
-  json += "\"smoothing\":" + String(ADC_SMOOTHING, 3);
+  json += "\"smoothing\":" + String(ADC_SMOOTHING, 3) + ",";
+  json += "\"output_pin\":" + String(OUTPUT_PIN) + ",";
+  json += "\"long_press_ms\":" + String((int)LONG_PRESS_TIME);
   json += "}";
   server.send(200, "application/json", json);
 }
 
 void handleSetSettings() {
   if (server.hasArg("oversampling")) {
-    int newOversampling = server.arg("oversampling").toInt();
-    if (newOversampling >= 1 && newOversampling <= 64) ADC_OVERSAMPLING = newOversampling;
+    int v = server.arg("oversampling").toInt();
+    if (v >= 1 && v <= 64) ADC_OVERSAMPLING = v;
   }
   if (server.hasArg("smoothing")) {
-    float newSmoothing = server.arg("smoothing").toFloat();
-    if (newSmoothing >= 0.0 && newSmoothing <= 1.0) {
-      ADC_SMOOTHING = newSmoothing;
+    float v = server.arg("smoothing").toFloat();
+    if (v >= 0.0 && v <= 1.0) {
+      ADC_SMOOTHING = v;
       filteredCurrent = 0.0;
     }
+  }
+  if (server.hasArg("output_pin")) {
+    int v = server.arg("output_pin").toInt();
+    // Accept any valid ESP32-C3 GPIO (0-10, 18-21)
+    if (v >= 0 && v <= 21) {
+      // Release old pin first
+      pinMode(OUTPUT_PIN, INPUT);
+      OUTPUT_PIN = v;
+      pinMode(OUTPUT_PIN, OUTPUT);
+      digitalWrite(OUTPUT_PIN, outputEnabled ? HIGH : LOW);
+    }
+  }
+  if (server.hasArg("long_press_ms")) {
+    int v = server.arg("long_press_ms").toInt();
+    if (v >= 200 && v <= 5000) LONG_PRESS_TIME = (unsigned long)v;
   }
   saveSettings();
   handleGetSettings();
@@ -623,10 +653,11 @@ String getIndexHTML() {
     button { background: #059e8a; color: white; border: none; padding: 10px 20px; font-size: 1rem; border-radius: 5px; cursor: pointer; margin-top: 10px; }
     button:hover { background: #047a6a; }
     .success-msg { color: #059e8a; font-weight: bold; display: none; margin-top: 10px; }
+    .section-divider { border: none; border-top: 1px solid #ddd; margin: 20px 0; }
   </style>
 </head>
 <body>
-  <h1>USB Charge Monitor</h1>
+  <h1>ChargeCap</h1>
   <div class="stats">
     <div class="stat-box">
       <div class="stat-value" id="currentValue">0.00</div>
@@ -646,22 +677,44 @@ String getIndexHTML() {
     </div>
   </div>
   <div id="chart-current" style="width:100%; height:400px;"></div>
-  <h2>ADC Settings</h2>
+
+  <h2>Settings</h2>
   <div class="settings-box">
+
     <div class="setting-row">
       <div style="flex: 2;">
-        <div class="setting-label">Oversampling</div>
-        <div class="setting-desc">Number of ADC samples to average (1-64). Higher = smoother but slower.</div>
+        <div class="setting-label">Output GPIO Pin</div>
+        <div class="setting-desc">GPIO pin that drives the MOSFET/relay cutoff (0&ndash;21). Takes effect immediately &mdash; old pin is released. Default: 10.</div>
+      </div>
+      <input type="number" id="output_pin" class="setting-input" min="0" max="21" value="10">
+    </div>
+
+    <div class="setting-row">
+      <div style="flex: 2;">
+        <div class="setting-label">Trigger Hold Duration (ms)</div>
+        <div class="setting-desc">How long to hold the button to set the cutoff threshold (200&ndash;5000 ms). Default: 1000.</div>
+      </div>
+      <input type="number" id="long_press_ms" class="setting-input" min="200" max="5000" step="50" value="1000">
+    </div>
+
+    <hr class="section-divider">
+
+    <div class="setting-row">
+      <div style="flex: 2;">
+        <div class="setting-label">ADC Oversampling</div>
+        <div class="setting-desc">Number of ADC samples to average (1&ndash;64). Higher = smoother but slower.</div>
       </div>
       <input type="number" id="oversampling" class="setting-input" min="1" max="64" value="32">
     </div>
+
     <div class="setting-row">
       <div style="flex: 2;">
-        <div class="setting-label">Smoothing Factor</div>
-        <div class="setting-desc">Exponential moving average (0.0-1.0). Lower = smoother.</div>
+        <div class="setting-label">ADC Smoothing Factor</div>
+        <div class="setting-desc">Exponential moving average (0.0&ndash;1.0). Lower = smoother.</div>
       </div>
       <input type="number" id="smoothing" class="setting-input" min="0" max="1" step="0.01" value="0.10">
     </div>
+
     <button onclick="saveSettings()">Save Settings</button>
     <div class="success-msg" id="successMsg">Settings saved! Changes applied immediately.</div>
   </div>
@@ -670,7 +723,7 @@ String getIndexHTML() {
 var latestTime = 0;
 var chart = new Highcharts.Chart({
   chart: { renderTo: 'chart-current', zoomType: 'x' },
-  title: { text: 'USB Current Over Time' },
+  title: { text: 'Charge Current Over Time' },
   series: [{ name: 'Current', showInLegend: false, data: [], turboThreshold: 0 }],
   plotOptions: {
     line: { animation: false, dataLabels: { enabled: false }, marker: { enabled: false } },
@@ -749,8 +802,10 @@ function toggleOutput() {
 
 function saveSettings() {
   const params = new URLSearchParams();
-  params.append('oversampling', document.getElementById('oversampling').value);
-  params.append('smoothing', document.getElementById('smoothing').value);
+  params.append('oversampling',  document.getElementById('oversampling').value);
+  params.append('smoothing',     document.getElementById('smoothing').value);
+  params.append('output_pin',    document.getElementById('output_pin').value);
+  params.append('long_press_ms', document.getElementById('long_press_ms').value);
   fetch('/settings', {method:'POST', body:params}).then(r => r.json()).then(() => {
     document.getElementById('successMsg').style.display = 'block';
     setTimeout(() => { document.getElementById('successMsg').style.display = 'none'; }, 3000);
@@ -758,8 +813,10 @@ function saveSettings() {
 }
 
 fetch('/settings').then(r => r.json()).then(data => {
-  document.getElementById('oversampling').value = data.oversampling;
-  document.getElementById('smoothing').value = data.smoothing;
+  document.getElementById('oversampling').value  = data.oversampling;
+  document.getElementById('smoothing').value     = data.smoothing;
+  document.getElementById('output_pin').value    = data.output_pin;
+  document.getElementById('long_press_ms').value = data.long_press_ms;
 });
 </script>
 </html>
